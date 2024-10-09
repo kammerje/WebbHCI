@@ -13,6 +13,7 @@ import sys
 import astropy.io.fits as pyfits
 import astropy.stats
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
 
 import json
@@ -45,6 +46,7 @@ from webbpsf.constants import JWST_CIRCUMSCRIBED_DIAMETER
 from astropy.io import fits
 from spaceKLIP.starphot import get_stellar_magnitudes, read_spec_file
 import scipy.ndimage
+import lmfit
 
 import logging
 log = logging.getLogger(__name__)
@@ -632,7 +634,6 @@ class ImageTools():
 
         # Loop through concatenations.
         for i, key in enumerate(self.database.obs.keys()):
-            log.info('--> Concatenation ' + key)
 
             # Load in bunch of stuff
             # Find science, reference, and background files.
@@ -673,9 +674,6 @@ class ImageTools():
                     # Read FITS file.
                     fitsfile = self.database.obs[key]['FITSFILE'][j]
                     data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
-
-                    head, tail = os.path.split(fitsfile)
-                    log.info('  --> Background subtraction: ' + tail)
 
                     # Subtract the background per frame
                     data -= bg_data
@@ -1068,7 +1066,7 @@ class ImageTools():
                    subdir='bpcleaned',
                    restrict_to=None):
         """
-        **** DEPRECATED BY FIND_BAD_PIXELS() AND CLEAN_BAD_PIXELS() ****
+        **** TO BE DEPRECATED BY FIND_BAD_PIXELS() AND CLEAN_BAD_PIXELS() ****
         Identify and fix bad pixels.
 
         Parameters
@@ -1142,8 +1140,8 @@ class ImageTools():
         None.
 
         """
-        log.info('--> WARNING! The fix_bad_pixels() routine is deprecated, the ..........')
-        log.info('--> WARNING! find_bad_pixels() and clean_bad_pixels() are preferred!!!!')
+        # log.info('--> WARNING! The fix_bad_pixels() routine is deprecated, the ..........')
+        # log.info('--> WARNING! find_bad_pixels() and clean_bad_pixels() are preferred!!!!')
     
         # Set output directory.
         output_dir = os.path.join(self.database.output_dir, subdir)
@@ -1176,7 +1174,7 @@ class ImageTools():
                     # if self.database.obs[key]['TELESCOP'][j] == 'JWST' and self.database.obs[key]['INSTRUME'][j] == 'NIRCAM':
                     #     pxdq_temp = (pxdq_temp != 0) & np.logical_not(pxdq_temp & 512 == 512)
                     # else:
-                    pxdq_temp = (np.isnan(data) | (pxdq_temp & 1 == 1)) & np.logical_not((pxdq_temp & 512 == 512))
+                    pxdq_temp = (np.isnan(data) | (pxdq_temp & 1 == 1)) & np.logical_not(pxdq_temp & 512 == 512)
                     method_split = method.split('+')
                     for k in range(len(method_split)):
                         head, tail = os.path.split(fitsfile)
@@ -3383,5 +3381,365 @@ class ImageTools():
                     log.info(f" Plot saved in {output_file}")
                 plt.show()
                 plt.close(fig)
+                
+    @plt.style.context('spaceKLIP.sk_style')
+    def subtract_nircam_coron_background(self,
+                                        subdir='bgsub',
+                                        mask_snr_threshold=2,
+                                        r_excl_nfwhm=40,
+                                        q_clip=5.,
+                                        align_wrapped=True,
+                                        include_global_offset=True,
+                                        include_stellar_psf_component=True,
+                                        generate_plot=True,
+                                        save_model=False,
+                                        use_jbt_background=False,
+                                        bgmodel_dir=None, 
+                                        background_sb={},
+                                        restrict_to=None):
+        """
+        Fits and subtracts the astrophysical background in NIRCam coronagraphic
+        data following the procedure described in Lawson et al. (2024).
+        
+        Note: This step should only be applied to data that has already been
+        aligned. Otherwise, it will crash.
+        
+        For SW filters using a LW coronagraph, the field of view excludes the
+        neutral density squares. In this case, the astrophysical background and
+        the artificial background offset that we fit are fully degenerate in
+        the regions we consider (away from the coronagraph). Since SW
+        backgrounds should be low anyway, the default is to assume an
+        astrophysical background of zero here. Alternatively, the JWST
+        Backgrounds Tool can be used to estimate the background for affected
+        data instead (if use_jbt_background=True and the JWST Backgrounds Tool
+        is installed).
 
+        Parameters
+        ----------
+        subdir : str, optional
+            Name of the sub-directory where the data products will be saved.
+            The default is 'bgsub'.
+        mask_snr_threshold : float, optional
+            SNR threshold for features to be masked during fitting of the
+            background. SNR is estimated using the ERR FITS extension. The
+            default is 2.
+        r_excl_nfwhm : float, optional
+            Radius (in units of the effective PSF FWHM) of the region around
+            the star to exclude from the fit. The default is 50.
+        q_clip : float, optional
+            After computing BG model residuals, exclude q_clip% of pixels from
+            both ends of the residual distribution before computing chisq. This
+            is intended to avoid over-/under-estimation of the background due
+            to unmasked sources or artifacts. Default is 5.
+        align_wrapped : bool, optional 
+            Whether input data were aligned using a Fourier shift without
+            padding first (such that values wrapped at the edges). Default is
+            True.
+        include_global_offset : bool, optional
+            Whether to fit a uniform background offset along with the
+            astrophysical background model. This corrects for offsets induced
+            by ramp fitting or use of the median subtraction step. Default is
+            True.
+        include_stellar_psf_component : bool, optional
+            Whether to include a stellar PSF model component when optimizing
+            the background model. Default is True.
+        generate_plot : bool, optional 
+            Whether to generate a plot showing the data before and after
+            subtraction along with the model and masked residuals. Default is
+            True.
+        save_model : bool, optional
+            Whether to save the optimized background model. Default is False.
+        use_jbt_background : bool, optional
+            Whether to use the JWST Backgrounds Tool to estimate the background
+            surface brightness for data without coverage of ND squares.
+            Requires that jwst_backgrounds is installed. Default is False.
+        bgmodel_dir : str, optional
+            Path to the directory containing the normalized background model
+            component FITS files to use (or to which they should be
+            downloaded). If None, uses spaceKLIP/resources/nircam_bg_models/.
+            Default is None.
+        background_sb : dict, optional
+            A dictionary of fixed background surface brightness (SB) values (in
+            the same units as the data) to adopt for any included concatenation
+            keys. For each key in database.obs, if background_sb[key] is None
+            or if the key is not in background_sb, the background SB will be
+            fit for all observations of that concatenation if possible.
+            Otherwise, background_sb[key] should be an array-like of float or
+            None having the same length as database.obs[key]. If
+            background_sb[key][j] is None, the jth frame's background SB will
+            be fit, otherwise it will be fixed to the value
+            background_sb[key][j]. Default is {}.
+        restrict_to : str or None, optional
+            Restrict the background subtraction to a specific key in the
+            database. Default is None.
+        """
 
+        def get_jbt_background_est(t, ra, dec, wavelength):
+            """
+            Uses the JWST Backgrounds tool to estimate the background surface
+            brightness at a given time, position, and wavelength. 
+            """
+            from jwst_backgrounds import jbt
+            from astropy.time import Time
+            tobs = Time(t, format='mjd')
+            bkg = jbt.background(ra, dec, wavelength)
+            calendar = bkg.bkg_data['calendar']
+            tobs0 = Time(f'{tobs.datetime.year}-01-01T00:00:00')
+            thisday = int(np.round((tobs.mjd-tobs0.mjd)+1))
+            Fbg = bkg.bathtub['total_thiswave'][np.where(thisday == calendar)[0][0]]
+            return Fbg
+        
+        def background_objective(p, im, bg0, psf0, optmask, q=5):
+            """
+            Objective function for fitting the multi-component background model
+            using LMFit.
+            """
+            fbg, bg_offset, fpsf = [p[key] for key in p]
+            res = (im - fbg*bg0 - bg_offset - fpsf*psf0)[optmask]
+            low, upp = np.nanpercentile(res, [q, 100.-q])
+            return np.abs(res[(res >= low) & (res <= upp)])
+    
+        def get_stellar_model_path(key, bgmodel_dir):
+            """
+            Searches for the correct stellar model component on disk and
+            fetches from an online repository if needed. Returns the path to
+            the FITS file.
+            """
+            psffile = f'{bgmodel_dir}{key}_psf0.fits'
+            if not os.path.exists(psffile):
+                with fits.open(f'https://github.com/kdlawson/nircam_bgsub_go4050/raw/main/nominal_bgmodels/{key}_psf0.fits') as hdul:
+                    hdul.writeto(psffile)
+            return psffile
+
+        def get_background_model_path(key, bgmodel_dir):
+            """
+            Searches for the correct background model component on disk and
+            fetches from an online repository if needed. Returns the path to
+            the FITS file.
+            """
+            bgfile = f'{bgmodel_dir}{key}_background0.fits'
+            if not os.path.exists(bgfile):
+                with fits.open(f'https://github.com/kdlawson/nircam_bgsub_go4050/raw/main/nominal_bgmodels/{key}_background0.fits') as hdul:
+                    hdul.writeto(bgfile)
+            return bgfile
+
+        output_dir = os.path.join(self.database.output_dir, subdir+'/')
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
+            
+        if bgmodel_dir is None:
+            bgmodel_dir = os.path.join(os.path.split(os.path.abspath(__file__))[0], 'resources/nircam_bg_models/')
+        if not os.path.exists(bgmodel_dir):
+            os.makedirs(bgmodel_dir)
+
+        # Copy input SB dictionary so we can fill out / change values as needed.
+        bg_sb_dict = background_sb.copy()
+
+        for key in self.database.obs:
+            if ((restrict_to is not None) and (restrict_to not in key)) or not np.any(np.isin(self.database.obs[key]['TYPE'], ['SCI', 'REF'])):
+                continue
+
+            log.info('--> Concatenation ' + key)
+
+            # Fill out dictionary of SB values, replacing None with a fixed value where fitting is not possible (SW filters with LW coronagraphs).
+            if (key not in bg_sb_dict) or (bg_sb_dict[key] is None):
+                bg_sb_dict[key] = np.repeat(None, len(self.database.obs[key]))
+            for j,entry in enumerate(self.database.obs[key]):
+                if (entry['DETECTOR'] == 'NRCA2') and (entry['CORONMSK'] in ['MASK335R', 'MASK430R', 'MASKLWB']) and (entry['SUBARRAY'] != 'FULL') and (bg_sb_dict[key][j] is None): 
+                    if use_jbt_background:
+                        try:
+                            bg_sb_dict[key][j] = get_jbt_background_est(entry['EXPSTART'], entry['TARG_RA'], entry['TARG_DEC'], entry['CWAVEL'])
+                        except ModuleNotFoundError:
+                            raise ModuleNotFoundError("""
+                            JBT background estimation requires
+                            the jwst_backgrounds package. Either
+                            install jwst_backgrounds or rerun
+                            with use_jbt_background=False.
+                            """)
+                    else:
+                        bg_sb_dict[key][j] = 0.
+
+            db_tab = self.database.obs[key]
+
+            fwhm = db_tab['CWAVEL'][0] * 1e-6 / 5.2 * 180. / np.pi * 3600. / db_tab['PIXSCALE'][0]
+            blur_fwhm = db_tab['BLURFWHM'][0]
+            if np.isfinite(blur_fwhm):
+                blur_sigma = blur_fwhm/np.sqrt(8.*np.log(2.))
+            else:
+                blur_sigma = None
+
+            # Load the normalized stellar PSF model component
+            if include_stellar_psf_component:
+                psffile = get_stellar_model_path(key, bgmodel_dir=bgmodel_dir)
+                with fits.open(psffile) as hdul:
+                    psf0_osamp, hpsf0 = hdul['OVERSAMP'].data, hdul['OVERSAMP'].header
+                osamp = hpsf0['OSAMP']
+                c_psf0_osamp = np.array([hpsf0['CRPIX1'], hpsf0['CRPIX2']])-1
+                if blur_sigma is not None:
+                    psf0_osamp = gaussian_filter(psf0_osamp, blur_sigma*osamp)
+
+            # Load the normalized BG model component
+            if not np.all(bg_sb_dict[key] == 0):
+                bgfile = get_background_model_path(key, bgmodel_dir=bgmodel_dir)
+                with fits.open(bgfile) as hdul:
+                    bg0_osamp, hbg0 = hdul['OVERSAMP'].data, hdul['OVERSAMP'].header
+                c_coron_bg0 = np.array([hbg0['CRPIX1'], hbg0['CRPIX2']])-1
+                osamp = hbg0['OSAMP']
+                # Apply any blurring used for the data:
+                if blur_sigma is not None:
+                    bg0_osamp = gaussian_filter(bg0_osamp, blur_sigma*osamp)
+
+            files = db_tab['FITSFILE']
+
+            c_star = np.array([db_tab['CRPIX1'][0], db_tab['CRPIX2'][0]])-1
+
+            h1 = fits.getheader(files[0], ext=1)
+            ny, nx = h1['NAXIS2'], h1['NAXIS1']
+
+            rmap = np.sqrt((np.arange(0, nx, dtype=np.float32)-c_star[0])**2 + (np.arange(0, ny, dtype=np.float32)-c_star[1])[:, np.newaxis]**2)
+            rmap_nfwhm = rmap/fwhm # Map of each pixel's distance from the location of the star in units of the effective PSF FWHM
+
+            # With no alignment wrapping, the stellar PSF model should be the same for all frames, so we'll just set it up once outside the loop over files.
+            if not align_wrapped:
+                if include_stellar_psf_component:
+                    c_star_osamp = c_star*osamp + 0.5*(osamp-1)
+                    psf0_osamp_crop = webbpsf_ext.image_manip.crop_image(psf0_osamp, [ny*osamp, nx*osamp], 
+                                                                        xyloc=c_psf0_osamp, delx=c_star_osamp[0]-(nx*osamp-1)/2.,
+                                                                        dely=c_star_osamp[1]-(ny*osamp-1)/2.)
+                    psf0_crop = webbpsf_ext.image_manip.frebin(psf0_osamp_crop, scale=1/osamp, total=False)
+                else:
+                    psf0_crop = np.zeros((ny,nx), dtype=np.float32)
+                            
+            for j,f in enumerate(files):
+                if db_tab[j]['TYPE'] not in ['SCI', 'REF']:
+                    continue
+
+                head, tail = os.path.split(f)
+                log.info('  --> NIRCam Background Subtraction: ' + tail)
+
+                # Assume alignment and background differences between integrations are negligible, so we can use the higher SNR coadded exposure
+                with fits.open(f) as hdul:
+                    ints = hdul['SCI'].data
+                    errs = hdul['ERR'].data
+                    h1 = hdul['SCI'].header
+                    mask_offset = np.nanmedian(hdul['MASKOFFS'].data, axis=0)
+                    imshift = np.nanmedian(hdul['IMSHIFTS'].data, axis=0)
+
+                if np.ndim(ints) == 3:
+                    med = np.nanmedian(ints, axis=0)
+                    nsample = np.sum(np.isfinite(ints), axis=0)
+                    err = np.sqrt(np.nansum(errs**2, axis=0))/nsample
+                else: # In case using coadded data saved with only two dims
+                    med, err = ints, errs
+
+                c_coron = c_star - mask_offset # post-alignment mask center position
+
+                if align_wrapped:
+                    if bg_sb_dict[key][j] == 0:
+                        bg0_crop = np.zeros_like(med)
+                    else:
+                        c_coron_osamp_preshift = (c_coron-imshift)*osamp + 0.5*(osamp-1)
+                        bg0_osamp_crop = webbpsf_ext.image_manip.crop_image(bg0_osamp, [ny*osamp, nx*osamp], 
+                                                                            xyloc=c_coron_bg0, delx=c_coron_osamp_preshift[0]-(nx*osamp-1)/2.,
+                                                                            dely=c_coron_osamp_preshift[1]-(ny*osamp-1)/2.)
+                        bg0_osamp_crop = ut.imshift(bg0_osamp_crop, imshift*osamp, pad=False)
+                        bg0_crop = webbpsf_ext.image_manip.frebin(bg0_osamp_crop, scale=1/osamp, total=False) # Downsample to detector resolution
+
+                    if include_stellar_psf_component:
+                        c_star_osamp_preshift = (c_star-imshift)*osamp + 0.5*(osamp-1)
+                        psf0_osamp_crop = webbpsf_ext.image_manip.crop_image(psf0_osamp, [ny*osamp, nx*osamp], 
+                                                                            xyloc=c_psf0_osamp, delx=c_star_osamp_preshift[0]-(nx*osamp-1)/2.,
+                                                                            dely=c_star_osamp_preshift[1]-(ny*osamp-1)/2.)
+                        psf0_osamp_crop = ut.imshift(psf0_osamp_crop, imshift*osamp, pad=False)
+                        psf0_crop = webbpsf_ext.image_manip.frebin(psf0_osamp_crop, scale=1/osamp, total=False)
+                    else:
+                        psf0_crop = np.zeros_like(med)
+                else:
+                    if bg_sb_dict[key][j] == 0:
+                        bg0_crop = np.zeros_like(med)
+                    else:
+                        c_coron_osamp = c_coron*osamp + 0.5*(osamp-1)
+                        bg0_osamp_crop = webbpsf_ext.image_manip.crop_image(bg0_osamp, [ny*osamp, nx*osamp], 
+                                                                            xyloc=c_coron_bg0, delx=c_coron_osamp[0]-(nx*osamp-1)/2.,
+                                                                            dely=c_coron_osamp[1]-(ny*osamp-1)/2.)
+                        bg0_crop = webbpsf_ext.image_manip.frebin(bg0_osamp_crop, scale=1/osamp, total=False) # Downsample to detector resolution
+
+                if bg_sb_dict[key][j] is None:
+                    fbg0 = 1
+                    fbg_vary = True
+                else:
+                    fbg0 = bg_sb_dict[key][j]
+                    fbg_vary = False
+
+                optmask = rmap_nfwhm > r_excl_nfwhm
+                snr = med/err # SNR estimate using FITS ERR extension 
+                med_snr = np.nanmedian(snr[optmask]) # Median SNR in the nominal background area
+                low_snr = snr <= (med_snr+mask_snr_threshold) # High SNR features are those more than mask_snr_threshold sigma above the approximate BG SNR
+                optmask = optmask & low_snr
+
+                bg_offset0 = 0
+                fpsf0 = 1. if not include_stellar_psf_component else np.nansum((med-np.nanmedian(med[optmask])) * psf0_crop) / np.nansum((psf0_crop ** 2))
+
+                # Prepare the lmfit Parameters object with default values and sensible bounds
+                p = lmfit.Parameters()
+                p.add('fbg', value=fbg0, min=0, max=np.inf, vary=fbg_vary)
+                p.add('bg_offset', value=bg_offset0, min=-np.inf, max=0, vary=include_global_offset)
+                p.add('fpsf', value=fpsf0, min=0, max=fpsf0*10, vary=include_stellar_psf_component)
+
+                # Optimize the background model
+                result = lmfit.minimize(background_objective, p, args=(med, bg0_crop, psf0_crop, optmask, q_clip), method='powell')
+                pfin = result.params.valuesdict()
+                logstr = ', '.join([f"{key}:{value:.3f}" for key, value in pfin.items()])
+                log.info('  --> NIRCam Background Subtraction: ' + logstr)
+
+                # Compute the final background model and stellar PSF component:
+                bg = pfin['fbg']*bg0_crop + pfin['bg_offset']
+                psf = psf0_crop*pfin['fpsf']
+
+                f_out = output_dir+os.path.basename(os.path.normpath(f))
+
+                with fits.open(f) as hdul:
+                    hdul[1].data -= bg # Subtract the BG model from the original file
+                    hdul.writeto(f_out, overwrite=True) # Save to disk in the output directory
+                    if save_model:
+                        f_model = f_out.replace('.fits', '_background_model.fits')
+                        hdu1 = fits.ImageHDU(bg, name='BG')
+                        hdul_model = fits.HDUList([hdul[0], hdu1])
+                        if include_stellar_psf_component:
+                            hdul_model.append(fits.ImageHDU(psf, name='STELLAR_PSF'))
+
+                        # Add fit params to header
+                        hdul_model[0].header.update(pfin) 
+
+                        # Add all relevant settings to the header
+                        hdul_model[0].header.update(dict(include_global_offset=include_global_offset,
+                                                         mask_snr_threshold=mask_snr_threshold, r_excl_nfwhm=r_excl_nfwhm, q=q_clip,
+                                                         include_stellar_psf_component=include_stellar_psf_component))
+                        hdul_model.writeto(f_model, overwrite=True)
+                        hdul_model.close()
+
+                if generate_plot:
+                    res = med - bg
+                    res_psfsub = res - psf
+                    low, upp = np.nanpercentile((res_psfsub)[optmask], [q_clip, 100.-q_clip])
+                    res_inliers = np.where((res_psfsub >= low) & (res_psfsub <= upp) & optmask, res_psfsub, np.nan)
+                    cmap = copy.copy(mpl.colormaps.get_cmap('RdBu_r'))
+                    cmap.set_bad('white')
+                    clim = np.array([-1,1])*np.nanpercentile(np.abs(med), 90)
+                    plot_mask = np.isfinite(med)
+                    plot_ims = np.where(plot_mask, [med, bg, res_inliers, med-bg], np.nan)
+                    fig,axes = plt.subplots(1,4,figsize=(15,3.5), sharex=True, sharey=True)
+                    labels = ['Data', 'BG Model', 'Masked Residuals', 'Data (BG-subtracted)']
+                    norm = mpl.colors.Normalize(*clim)
+                    for ind,ax in enumerate(axes):
+                        ax.imshow(plot_ims[ind], norm=norm, interpolation='None', origin='lower', cmap=cmap)
+                        ax.set_title(labels[ind], pad=10)
+                    fig.tight_layout(w_pad=1.00)
+                    fig.colorbar(mpl.cm.ScalarMappable(norm, cmap), ax=axes, pad=0.015, label='[MJy / Sr]')     
+                    plt.savefig(output_dir+os.path.basename(os.path.normpath(f)).replace('.fits', '_background_model.pdf'), bbox_inches='tight')
+                    plt.close(fig)
+
+                mask_in = db_tab['MASKFILE'][j]
+                mask = ut.read_msk(mask_in)
+                mask_out = ut.write_msk(mask_in, mask, f_out)
+                self.database.update_obs(key, j, f_out, mask_out)
